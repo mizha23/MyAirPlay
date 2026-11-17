@@ -8,6 +8,7 @@ import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn as AndroidxOptIn
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
@@ -31,7 +32,10 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -152,7 +156,7 @@ fun MainScreen(
     if (videoScreen) {
         val videoPlaybackAspect by viewModel.videoPlaybackAspect.collectAsState()
         val playback: @Composable () -> Unit = {
-            VideoSurfaceView(
+            VideoTextureView(
                 onSurfaceAvailable = { viewModel.onVideoPlaybackSurfaceAvailable(it) },
                 onSurfaceDestroyed = { viewModel.onVideoPlaybackSurfaceDestroyed(it) },
                 aspectRatio = videoPlaybackAspect
@@ -213,7 +217,9 @@ fun MainScreen(
         }
         // orientation follows the video aspect; manual rotate holds until the next video
         LaunchedEffect(videoPlaybackAspect) {
-            activity?.requestedOrientation = if (videoPlaybackAspect < 1f) {
+            activity?.requestedOrientation = if (context.isTvDevice() || android.os.Build.MANUFACTURER.equals("Appo", ignoreCase = true)) {
+                ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            } else if (videoPlaybackAspect < 1f) {
                 ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
             } else {
                 ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
@@ -302,7 +308,7 @@ fun MainScreen(
                 contentScale = zoomState.contentScale,
                 zoom = zoomState.zoom
             ) { sizeModifier ->
-                VideoSurfaceView(
+                VideoTextureView(
                     onSurfaceAvailable = { viewModel.onVideoPlaybackSurfaceAvailable(it) },
                     onSurfaceDestroyed = { viewModel.onVideoPlaybackSurfaceDestroyed(it) },
                     applyAspectRatio = false,
@@ -1083,6 +1089,55 @@ private fun DebugOverlay(info: DebugInfo, modifier: Modifier = Modifier) {
             Text(section.title.uppercase(), style = headingStyle, color = headingColor)
             section.lines.forEach { Text(it, style = style, color = color) }
         }
+        if (info.videoCodec.isNotEmpty() &&
+            (info.outputIntervalsMs.isNotEmpty() || info.arrivalIntervalsMs.isNotEmpty())
+        ) {
+            Spacer(Modifier.height(6.dp))
+            FrameIntervalChart(
+                outputMs = info.outputIntervalsMs,
+                arrivalMs = info.arrivalIntervalsMs,
+                modifier = Modifier.width(280.dp).height(72.dp),
+            )
+            Text(context.getString(R.string.debug_mirror_curve), style = style, color = color)
+        }
+    }
+}
+
+// frame-interval history: arrival (grey) vs decoder output (green), 33.3ms target (red, dashed)
+@Composable
+private fun FrameIntervalChart(
+    outputMs: List<Float>,
+    arrivalMs: List<Float>,
+    modifier: Modifier = Modifier,
+) {
+    Canvas(modifier = modifier) {
+        val maxMs = 100f
+        val targetMs = 1000f / 30f
+        val h = size.height
+        val w = size.width
+        fun y(v: Float) = h - (v.coerceIn(0f, maxMs) / maxMs) * h
+        drawLine(
+            color = Color.Red.copy(alpha = 0.7f),
+            start = Offset(0f, y(targetMs)),
+            end = Offset(w, y(targetMs)),
+            strokeWidth = 1f,
+            pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 4f)),
+        )
+        drawSeries(arrivalMs, Color.LightGray.copy(alpha = 0.8f), w, ::y)
+        drawSeries(outputMs, Color(0xFF69F0AE), w, ::y)
+    }
+}
+
+private fun DrawScope.drawSeries(values: List<Float>, color: Color, width: Float, y: (Float) -> Float) {
+    if (values.size < 2) return
+    val stepX = width / (values.size - 1)
+    for (i in 0 until values.size - 1) {
+        drawLine(
+            color = color,
+            start = Offset(i * stepX, y(values[i])),
+            end = Offset((i + 1) * stepX, y(values[i + 1])),
+            strokeWidth = 1.5f,
+        )
     }
 }
 
@@ -1097,6 +1152,34 @@ private fun debugOverlaySections(context: Context, info: DebugInfo): List<DebugS
             add(context.getString(R.string.debug_jitter, info.jitterStr))
         }
     }.takeIf { it.isNotEmpty() }?.let { add(DebugSection(context.getString(R.string.debug_section_video), it)) }
+
+    buildList {
+        if (info.videoCodec.isNotEmpty()) {
+            add(context.getString(R.string.debug_mirror_fps, info.videoFps, info.outputFps))
+            add(
+                context.getString(
+                    R.string.debug_mirror_jitter,
+                    info.jitterStr,
+                    formatJitterUs(info.arrivalJitterUs),
+                    formatJitterUs(info.ptsJitterUs),
+                )
+            )
+            add(context.getString(R.string.debug_mirror_feed, info.feedMeanMs, info.feedMaxMs))
+            add(
+                context.getString(
+                    R.string.debug_mirror_res,
+                    info.advertisedRes,
+                    info.advertisedFps,
+                    info.videoRes.ifEmpty { "?" },
+                    info.decodedRes.ifEmpty { "?" },
+                )
+            )
+            add(context.getString(R.string.debug_mirror_drain, info.drainReleased, info.drainErrors))
+            if (info.drainLastError.isNotEmpty()) {
+                add(context.getString(R.string.debug_mirror_drain_err, info.drainLastError))
+            }
+        }
+    }.takeIf { it.isNotEmpty() }?.let { add(DebugSection(context.getString(R.string.debug_section_mirror), it)) }
 
     buildList {
         if (info.audioCodec.isNotEmpty()) add(context.getString(R.string.debug_audio, info.audioCodec, info.serverVolume, info.clientVolume))
@@ -1114,3 +1197,7 @@ private fun debugOverlaySections(context: Context, info: DebugInfo): List<DebugS
 private fun formatDecode(meanUs: Int, maxUs: Int, held: Int, errors: Int): String =
     (if (meanUs == 0) "held=$held"
     else "%.1f/%.1f ms held=%d".format(meanUs / 1000.0, maxUs / 1000.0, held)) + " errs=$errors"
+
+// same shape as DebugInfo.jitterStr, for the extra jitter fields
+private fun formatJitterUs(us: Long): String =
+    if (us >= 1000) "%.1f ms".format(us / 1000.0) else "$us us"

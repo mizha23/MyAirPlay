@@ -122,7 +122,7 @@ static void _video_process(void *cls, raop_ntp_t *ntp, video_decode_struct *data
     jbyteArray arr = (*env)->NewByteArray(env, data->data_len);
     (*env)->SetByteArrayRegion(env, arr, 0, data->data_len, (jbyte *)data->data);
     (*env)->CallVoidMethod(env, ctx->callback_obj, ctx->on_video_data,
-                           arr, (jlong)data->ntp_time_local, (jboolean)data->is_h265);
+                           arr, (jlong)data->ntp_time_remote, (jboolean)data->is_h265);
     (*env)->DeleteLocalRef(env, arr);
 }
 

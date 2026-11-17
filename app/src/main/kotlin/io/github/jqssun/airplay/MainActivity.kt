@@ -69,7 +69,7 @@ class MainActivity : ComponentActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !_granted(Manifest.permission.POST_NOTIFICATIONS)) {
                 add(Manifest.permission.POST_NOTIFICATIONS)
             }
-            if (!hasLocalNetwork()) add(Manifest.permission.ACCESS_LOCAL_NETWORK)
+            if (!hasLocalNetwork()) add(ACCESS_LOCAL_NETWORK)
         }
         if (missing.isNotEmpty()) permissions.launch(missing.toTypedArray())
 
@@ -139,8 +139,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun _syncLocalNetwork(requested: Boolean = false) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.CINNAMON_BUN) return
-        val p = Manifest.permission.ACCESS_LOCAL_NETWORK
+        if (Build.VERSION.SDK_INT < CINNAMON_BUN) return
+        val p = ACCESS_LOCAL_NETWORK
         val prev = viewModel.localNetwork.value
         val now = when {
             hasLocalNetwork() -> LocalNetworkAccess.GRANTED
@@ -153,11 +153,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun _requestLocalNetwork() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.CINNAMON_BUN) return
+        if (Build.VERSION.SDK_INT < CINNAMON_BUN) return
         if (viewModel.localNetwork.value == LocalNetworkAccess.SETTINGS) {
             startActivity(appSettingsIntent())
         } else {
-            permissions.launch(arrayOf(Manifest.permission.ACCESS_LOCAL_NETWORK))
+            permissions.launch(arrayOf(ACCESS_LOCAL_NETWORK))
         }
     }
 
@@ -198,6 +198,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        android.util.Log.i("MirrorLifecycle", "onStop pid=${android.os.Process.myPid()} finishing=$isFinishing changingConfig=$isChangingConfigurations")
         super.onStop()
         // never stop mid-session
         if (!viewModel.pref(Prefs.RUN_IN_BACKGROUND).value && !isChangingConfigurations &&
@@ -208,6 +209,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        android.util.Log.i("MirrorLifecycle", "onDestroy pid=${android.os.Process.myPid()} finishing=$isFinishing changingConfig=$isChangingConfigurations")
         service?.let {
             if (it.logCallback === logCallback) it.logCallback = null
             if (it.pinCallback === pinCallback) it.pinCallback = null

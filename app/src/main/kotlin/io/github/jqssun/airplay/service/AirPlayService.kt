@@ -61,6 +61,7 @@ import java.security.SecureRandom
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.debounce
@@ -80,6 +81,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
 
     private var nativeHandle = 0L
     private var nsdManager: NsdServiceManager? = null
+    private var mdnsCollectJob: Job? = null
     private var usbAdvertiser: UsbMdnsAdvertiser? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var foregroundStarted = false
@@ -100,6 +102,13 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     }
     private val _serverState = MutableStateFlow(ServerState.STOPPED)
     val serverState = _serverState.asStateFlow()
+
+    // true mDNS state: REGISTERED only when every service is actually
+    // discoverable; RETRYING / DEGRADED / FAILED surface broadcast
+    // problems instead of silently showing RUNNING while iPhones see
+    // nothing.
+    private val _mdnsStatus = MutableStateFlow(NsdServiceManager.MdnsStatus.IDLE)
+    val mdnsStatus = _mdnsStatus.asStateFlow()
 
     private val _connectionCount = MutableStateFlow(0)
     val connectionCount = _connectionCount.asStateFlow()
@@ -172,6 +181,23 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     lateinit var dacpPlayer: DacpPlayer
         private set
     private val _mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var hadAirPlayMedia = false
+    private val returnHome = Runnable {
+        if (ReturnHomePolicy.shouldReturn(hadAirPlayMedia, _connectionCount.value, _videoPlaybackActive.value, _mirroringActive.value, videoSessionPending())) {
+            hadAirPlayMedia = false
+            val home = packageManager.getLaunchIntentForPackage("com.ming.tvhome")
+                ?: Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            home.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            runCatching { startActivity(home) }
+                .onSuccess { log("AirPlay ended: returning to TV home") }
+                .onFailure { Log.w(TAG, "Unable to return to TV home", it) }
+        }
+    }
+    private fun scheduleReturnHome() {
+        _mainHandler.removeCallbacks(returnHome)
+        _mainHandler.postDelayed(returnHome, 1500L)
+    }
+
     @Volatile private var _coverArtBytes: ByteArray? = null
     private var mediaSession: MediaSessionCompat? = null
     private var mediaReceiver: BroadcastReceiver? = null
@@ -310,7 +336,8 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
             _videoPlaybackSize.value = width to height
         }
         airPlayVideoPlayer.onTitle = { _videoTitle.value = it ?: "" }
-        airPlayVideoPlayer.onEnded = { _endVideoPlayback("AirPlay Video stopped (player)") }
+        airPlayVideoPlayer.onEnded = { _endVideoPlayback("AirPlay Video completed (end of media)") }
+        airPlayVideoPlayer.onError = { code -> _endVideoPlayback("AirPlay Video failed (player error=$code)") }
         airPlayVideoPlayer.onPlaybackInfo = { snapshot ->
             if (nativeHandle != 0L) {
                 NativeBridge.nativeUpdatePlaybackInfo(nativeHandle, snapshot.position, snapshot.duration, snapshot.rate, snapshot.ready)
@@ -348,12 +375,17 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_START_SERVER) {
+        if (intent?.action == ACTION_START_SERVER || intent == null) {
+            // null intent = the system restarting us after killing the
+            // process (START_STICKY): bring the server back up so the
+            // receiver stays discoverable. An explicit stopSelf() (see
+            // stopServer()) does NOT trigger a restart, so this cannot
+            // resurrect a server the user deliberately stopped.
             promoteToForeground()
             _startServer(ensureServiceStarted = false)
             if (_serverState.value != ServerState.RUNNING) stopSelf(startId)
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     fun startServer() {
@@ -372,7 +404,15 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "airplay:server").apply { acquire() }
 
-        nsdManager = NsdServiceManager(this).apply { acquireMulticastLock() }
+        val manager = NsdServiceManager(this).apply { acquireMulticastLock() }
+        nsdManager = manager
+        mdnsCollectJob?.cancel()
+        mdnsCollectJob = lifecycleScope.launch {
+            manager.status.collect {
+                _mdnsStatus.value = it
+                log("mDNS status: $it")
+            }
+        }
 
         val hwAddr = getHwAddr()
         val keyFile = filesDir.resolve("airplay.pem").absolutePath
@@ -406,10 +446,34 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
 
         videoRenderer.enforceSdr = prefs[Prefs.ENFORCE_SDR]
         videoRenderer.keyAllowFrameDrop = prefs[Prefs.KEY_ALLOW_FRAME_DROP]
+        videoRenderer.videoLowLatency = prefs[Prefs.VIDEO_LOW_LATENCY]
+        videoRenderer.ptsMode = prefs[Prefs.MIRROR_PTS_MODE]
+        // Mirror recovery escalation (round 5): posted to the main
+        // handler — a session restart joins the decode/drain threads and
+        // must not run on them. A session restart resets the renderer
+        // pipeline while the RAOP session stays up (the sender keeps
+        // streaming, its next periodic IDR restarts the picture); a
+        // server restart disconnects the sender, so the next mirror
+        // stream necessarily starts with a fresh IDR.
+        videoRenderer.onRequestSessionRestart = {
+            _mainHandler.post {
+                log("Mirror recovery: restarting video session")
+                videoRenderer.stopSession()
+                videoRenderer.startSession()
+            }
+        }
+        videoRenderer.onRequestServerRestart = {
+            _mainHandler.post {
+                log("Mirror recovery: restarting server after repeated failed recovery")
+                _restartServer()
+            }
+        }
         videoRenderer.selector.maxOperatingRate = Prefs.forced(prefs[Prefs.OPERATING_RATE])
         videoRenderer.benchmarkLog = prefs[Prefs.BENCHMARK_LOG]
         videoRenderer.benchmarkLogCallback = { msg -> logCallback?.invoke(msg) }
         videoRenderer.scheduledOutputBufferRelease = prefs[Prefs.SCHEDULED_OUTPUT_BUFFER_RELEASE]
+        videoRenderer.jitterBufferEnabled = prefs[Prefs.MIRROR_JITTER_BUFFER]
+        videoRenderer.jitterBufferTargetMs = prefs[Prefs.MIRROR_JITTER_BUFFER_MS]
         NativeBridge.nativeSetH265Enabled(nativeHandle, h265)
         NativeBridge.nativeSetCodecs(nativeHandle, alac, aac)
         val advertiseVideo = prefs[Prefs.ADVERTISE_VIDEO]
@@ -508,6 +572,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         }
         nsdManager?.release()
         nsdManager = null
+        mdnsCollectJob?.cancel()
+        mdnsCollectJob = null
+        _mdnsStatus.value = NsdServiceManager.MdnsStatus.IDLE
         wakeLock?.release()
         wakeLock = null
         _serverState.value = ServerState.ERROR
@@ -543,6 +610,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         usbAdvertiser = null
         nsdManager?.release()
         nsdManager = null
+        mdnsCollectJob?.cancel()
+        mdnsCollectJob = null
+        _mdnsStatus.value = NsdServiceManager.MdnsStatus.IDLE
         wakeLock?.release()
         wakeLock = null
         videoRenderer.release()
@@ -621,6 +691,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         airPlayVideoPlayer.stop()
         if (!_audioOnly.value) mediaSession?.isActive = false
         log(message)
+        scheduleReturnHome()
     }
 
     override fun onDestroy() {
@@ -652,6 +723,8 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     }
 
     override fun onVideoPlay(location: String, startPositionSeconds: Float) {
+        hadAirPlayMedia = true
+        _mainHandler.removeCallbacks(returnHome)
         _videoLocation.value = location
         _videoPlaySeq.value++
         _videoPollSuppressed = false
@@ -674,7 +747,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         airPlayVideoPlayer.setRate(rate)
     }
 
-    override fun onVideoStop() = _endVideoPlayback("AirPlay Video stopped")
+    override fun onVideoStop() = _endVideoPlayback("AirPlay Video stopped (sender /stop)")
 
     override fun onAudioFormat(ct: Int, spf: Int, usingScreen: Boolean) {
         clearPin()
@@ -794,6 +867,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     }
 
     override fun onConnectionInit() {
+        _mainHandler.removeCallbacks(returnHome)
         val firstConnection = _connectionCount.value == 0
         _connectionCount.value++
         log("Sender connected (${_connectionCount.value})")
@@ -829,6 +903,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
             _updateMediaNotification()
         }
         log("Sender disconnected (${_connectionCount.value})")
+        if (_connectionCount.value == 0) scheduleReturnHome()
     }
 
     override fun onConnectionReset(reason: Int) {
@@ -885,9 +960,14 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     }
 
     override fun onMirrorRunning(running: Boolean) {
-        if (running) videoRenderer.startSession() else {
+        if (running) {
+            hadAirPlayMedia = true
+            _mainHandler.removeCallbacks(returnHome)
+            videoRenderer.startSession()
+        } else {
             videoRenderer.stopSession()
             _mirroringActive.value = false
+            scheduleReturnHome()
         }
         _setAudioOnly(!running)
     }
@@ -1016,6 +1096,23 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         videoFrames = videoRenderer.frameCount,
         droppedFrames = videoRenderer.droppedFrames,
         framePacingJitterUs = videoRenderer.framePacingJitterUs,
+        outputFps = videoRenderer.outputFps,
+        arrivalJitterUs = videoRenderer.arrivalJitterUs,
+        ptsJitterUs = videoRenderer.ptsJitterUs,
+        feedMeanMs = videoRenderer.feedMeanMs,
+        feedMaxMs = videoRenderer.feedMaxMs,
+        decodedRes = run {
+            val w = videoRenderer.decodedWidth
+            val h = videoRenderer.decodedHeight
+            if (w > 0 && h > 0) "${w}x${h}" else ""
+        },
+        advertisedRes = prefs[Prefs.RESOLUTION],
+        advertisedFps = prefs[Prefs.MAX_FPS],
+        outputIntervalsMs = videoRenderer.outputIntervalsMs,
+        arrivalIntervalsMs = videoRenderer.arrivalIntervalsMs,
+        drainReleased = videoRenderer.drainReleased,
+        drainErrors = videoRenderer.drainErrors,
+        drainLastError = videoRenderer.drainLastError,
         audioCodec = audioRenderer.codecLabel,
         serverVolume = 100 * audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) / _serverVolMax(),
         clientVolume = (100 * clientVolume()).roundToInt(),

@@ -1,0 +1,92 @@
+--- a/lib/airplay_video.c
++++ b/lib/airplay_video.c
+@@ -330,7 +330,10 @@
+     const char *start;
+     int len;
+     bool is_default;
+-    char code[6];
++    /* BCP 47 language tags in YouTube HLS playlists can be much longer
++     * than 5 characters (e.g. "zh-Hans-CN", "es-419"); keep room for them.
++     * The copy below is still length-checked and NUL-terminated. */
++    char code[32];
+     char *name;
+ } language_t;
+ 
+@@ -399,7 +402,18 @@
+         if (!(end = strchr(++ptr,'"'))) {
+             break;
+         }
+-        strncpy(languages[i].code, ptr, end - ptr);
++        /* Clamp to the buffer and always NUL-terminate: an unchecked
++         * strncpy here used to overflow code[] on tags longer than
++         * 5 chars (FORTIFY abort / SIGABRT on Android). Truncation
++         * is safe for the callers: dedup compares truncated codes
++         * (identical tags truncate identically) and language matching
++         * only looks at the first 2 characters. */
++        size_t code_len = (size_t) (end - ptr);
++        if (code_len >= sizeof(languages[i].code)) {
++            code_len = sizeof(languages[i].code) - 1;
++        }
++        strncpy(languages[i].code, ptr, code_len);
++        languages[i].code[code_len] = '\0';
+         if (!(ptr = strchr(ptr,'\n'))) {
+             break;
+         }
+@@ -407,15 +421,24 @@
+         languages[i].len = (int) (ptr + 1 - languages[i].start);
+ 	    length += languages[i].len;
+     }
+-    assert (count1 == count);
+-    
++    /* A malformed playlist must not abort the service: these used to
++     * be asserts, which are live in debug builds, so a playlist that
++     * breaks out of the loop early (or has an unexpected structure)
++     * killed the whole native process. Fail cleanly instead; the
++     * caller keeps the playlist unchanged when we return NULL. */
++    if (count1 != count) {
++        goto fail;
++    }
++
+     languages[count + 1].start = ++ptr;
+     languages[count + 1].len = strlen(ptr);
+     *languages[count + 1].code = '\0';
+     languages[count + 1].name = NULL;
+ 
+     length += languages[count + 1].len;
+-    assert(length == strlen(data));
++    if (length != strlen(data)) {
++        goto fail;
++    }
+     *slices = count + 2;
+ 
+     int copies = 0;
+@@ -426,16 +449,27 @@
+      }
+ 
+     *language_count = count/copies;
+-    assert(count == *language_count * copies);
++    if (count != *language_count * copies) {
++        goto fail;
++    }
+ 
+     /* verify expected structure of language choice information */
+     for (int i = 1; i <= count; i++) {
+   	int j = i - *language_count;
+         if (j > 0) {
+-            assert (!strcmp(languages[i].code, languages[j].code));
++            if (strcmp(languages[i].code, languages[j].code)) {
++                goto fail;
++            }
+         }
+     }
+     return languages;
++
++fail:
++    for (int i = 1; i <= count; i++) {
++        free(languages[i].name);
++    }
++    free(languages);
++    return NULL;
+ }
+ 
+ char * select_master_playlist_language(airplay_video_t *airplay_video, char *master_playlist) {

@@ -1,0 +1,20 @@
+diff --git a/lib/http_handlers.h b/lib/http_handlers.h
+--- a/lib/http_handlers.h
++++ b/lib/http_handlers.h
+@@ -73,7 +73,15 @@
+      * 6. (unknown)
+      * 9. audio supported.
+      */
+-    plist_t features_node = plist_new_uint(0x27F); 
++    /* Bits 0 (video) and 4 (HLS) only apply while HLS support is on; keep
++     * server-info consistent with the mDNS TXT records (see
++     * nativeSetHlsEnabled). With HLS off, senders would otherwise try
++     * /play and get silently dropped by the raop.c gate. */
++    uint64_t features = 0x27F;
++    if (!raop->hls_support) {
++        features &= ~0x11u;
++    }
++    plist_t features_node = plist_new_uint(features);
+     plist_dict_set_item(r_node, "features", features_node);
+ 
+     plist_t mac_address_node = plist_new_string(hw_addr);

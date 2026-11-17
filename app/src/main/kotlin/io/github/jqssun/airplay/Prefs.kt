@@ -72,7 +72,7 @@ object Prefs {
 
     fun forced(v: String) = when (v) { ON -> true; OFF -> false; else -> null }
 
-    val SERVER_NAME = str("server_name", "Android AirPlay", restart = true)
+    val SERVER_NAME = str("server_name", "MyAirplay", restart = true)
     val SERVER_PORT = int("server_port", 7000, 1..65535, restart = true)
     val AUTO_START = bool("auto_start", true)
     val BOOT_AUTO_START = bool("boot_auto_start", true)
@@ -83,7 +83,19 @@ object Prefs {
     val KEY_PRIORITY = bool(MediaFormat.KEY_PRIORITY, true, restart = true)
     val LOW_LATENCY = bool("low_latency", false)
     val OPERATING_RATE = tri("operating_rate", restart = true)
+    // Video low-latency parameters (DecoderSelector.lowLatencyOptions).
+    // Default on = current behaviour (forced on first configure).
+    // Independent of LOW_LATENCY, which is audio-only.
+    val VIDEO_LOW_LATENCY = bool("video_low_latency", true, restart = true)
     val SCHEDULED_OUTPUT_BUFFER_RELEASE = bool("scheduled_output_buffer_release", false, restart = true)
+    // mirror jitter buffer: hold incoming frames briefly and feed the decoder
+    // on presentation-time pace (see FramePacer); off = old synchronous path
+    val MIRROR_JITTER_BUFFER = bool("mirror_jitter_buffer", true, restart = true)
+    val MIRROR_JITTER_BUFFER_MS = int("mirror_jitter_buffer_ms", 100, 50..300, restart = true)
+    // mirror PTS mode (round 5): "continuous" (round 4, default),
+    // "rebase" (round 3), "raw" (original passthrough). For A/B testing
+    // which timestamp change triggered the round-4 black screen.
+    val MIRROR_PTS_MODE = str("mirror_pts_mode", "continuous", restart = true) { it in setOf("continuous", "rebase", "raw") }
     val AUDIO_AUTO_BUFFER = bool("audio_auto_buffer", true)
     // fixed cushion ms, used only when AUDIO_AUTO_BUFFER is off
     val AUDIO_CUSHION_MS = int("audio_cushion_ms", 40, 1..1000)

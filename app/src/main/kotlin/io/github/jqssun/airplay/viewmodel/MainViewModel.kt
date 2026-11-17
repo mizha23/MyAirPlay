@@ -56,6 +56,22 @@ data class DebugInfo(
     val videoFrames: Long = 0,
     val droppedFrames: Long = 0,
     val framePacingJitterUs: Long = 0,
+    // mirror diagnostics: in/out fps, jitter split, feed cost, advertised vs actual
+    val outputFps: Int = 0,
+    val arrivalJitterUs: Long = 0,
+    val ptsJitterUs: Long = 0,
+    val feedMeanMs: Float = 0f,
+    val feedMaxMs: Float = 0f,
+    val decodedRes: String = "",
+    val advertisedRes: String = "",
+    val advertisedFps: Int = 0,
+    val outputIntervalsMs: List<Float> = emptyList(),
+    val arrivalIntervalsMs: List<Float> = emptyList(),
+    // drain diagnostics: released/error counts prove whether the decoder's
+    // output is actually being drained (VAVA 2026-11-16: Out 0 fps).
+    val drainReleased: Long = 0,
+    val drainErrors: Long = 0,
+    val drainLastError: String = "",
     val audioCodec: String = "",
     val serverVolume: Int = 100,
     val clientVolume: Int = 100,

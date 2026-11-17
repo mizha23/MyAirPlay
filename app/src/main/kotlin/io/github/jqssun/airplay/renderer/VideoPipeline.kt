@@ -14,8 +14,12 @@ import java.nio.FloatBuffer
 
 // decodes into an app-owned SurfaceTexture that outlives display surface
 // gl thread blits it to any surface attached, so fullscreen toggles re-point display without restarting codec
-class VideoPipeline {
+class VideoPipeline(private val manageFrameEpoch: Boolean = true) {
 
+    @Volatile private var diagnosticCallbacks = 0L
+    @Volatile private var diagnosticConsumed = 0L
+    @Volatile private var diagnosticSwaps = 0L
+    fun diagnosticState(): String = "callbacks=$diagnosticCallbacks,consumed=$diagnosticConsumed,swaps=$diagnosticSwaps,threadAlive=${thread?.isAlive}"
     private val lock = Object()
     private var thread: Thread? = null
     @Volatile private var running = false
@@ -39,12 +43,25 @@ class VideoPipeline {
     @Volatile private var frameAvailable = false
     private var pendingDisplay: Surface? = null
     private var displayDirty = false
+    private var sizeDirty = false
+    private var awaitingNewFrameRelease = false
+    private var minimumFrameTimestampNs = Long.MIN_VALUE
+    fun beforeFrameRelease(ptsUs: Long) = synchronized(lock) {
+        if (awaitingNewFrameRelease) {
+            minimumFrameTimestampNs = if (ptsUs > 0) ptsUs * 1000L else Long.MIN_VALUE
+            awaitingNewFrameRelease = false
+        }
+    }
+    private fun acceptsFrame(timestampNs: Long): Boolean = synchronized(lock) {
+        !awaitingNewFrameRelease && (timestampNs <= 0 || timestampNs >= minimumFrameTimestampNs)
+    }
     @Volatile private var videoW = 0
     @Volatile private var videoH = 0
 
     fun start() = synchronized(lock) {
         if (running) return@synchronized
         running = true
+        if (pendingDisplay != null) displayDirty = true
         thread = Thread({ _loop() }, "VideoPipeline").also { it.start() }
         while (inputSurface == null && running) lock.wait()
     }
@@ -55,10 +72,16 @@ class VideoPipeline {
         lock.notifyAll()
     }
 
-    fun setVideoSize(w: Int, h: Int) {
+    fun setVideoSize(w: Int, h: Int) = synchronized(lock) {
+        if (w == videoW && h == videoH) return@synchronized
         videoW = w
         videoH = h
-        surfaceTexture?.setDefaultBufferSize(w, h)
+        sizeDirty = true
+        awaitingNewFrameRelease = manageFrameEpoch
+        lock.notifyAll()
+        val deadline = System.nanoTime() + 500_000_000L
+        while (running && sizeDirty && System.nanoTime() < deadline) lock.wait(20)
+        if (running && sizeDirty) Log.w(TAG, "MirrorGL resize acknowledgement timed out: ${w}x$h")
     }
 
     fun release() {
@@ -90,7 +113,21 @@ class VideoPipeline {
             var displayChanged = false
             var doFrame = false
             synchronized(lock) {
-                while (running && !frameAvailable && !displayDirty) lock.wait()
+                while (running && !frameAvailable && !displayDirty && !sizeDirty) lock.wait()
+                if (running && sizeDirty) {
+                    if (frameAvailable) {
+                        egl?.makeCurrent()
+                        runCatching { surfaceTexture?.updateTexImage() }
+                            .onFailure { Log.w(TAG, "MirrorGL retiring old frame during resize", it) }
+                        diagnosticConsumed++
+                    }
+                    frameAvailable = false
+                    hasFrame = false
+                    surfaceTexture?.setDefaultBufferSize(videoW, videoH)
+                    sizeDirty = false
+                    Log.i(TAG, "MirrorGL resize applied: ${videoW}x$videoH")
+                    lock.notifyAll()
+                }
                 if (running && displayDirty) {
                     newDisplay = pendingDisplay
                     displayChanged = true
@@ -135,17 +172,26 @@ class VideoPipeline {
             // no display: keep consuming so decoder doesn't stall
             egl.makeCurrent()
             st.updateTexImage()
+            diagnosticConsumed++
+            st.getTransformMatrix(texMatrix)
+            if (!acceptsFrame(st.timestamp)) return
             hasFrame = true
             return
         }
         egl.makeCurrent(window)
         st.updateTexImage()
+        diagnosticConsumed++
         st.getTransformMatrix(texMatrix)
+        if (!acceptsFrame(st.timestamp)) return
         hasFrame = true
         _render()
     }
 
     private fun _render() {
+        val currentEgl = egl ?: return
+        winW = currentEgl.query(window, EGL14.EGL_WIDTH)
+        winH = currentEgl.query(window, EGL14.EGL_HEIGHT)
+        if (winW <= 0 || winH <= 0) return
         GLES20.glViewport(0, 0, winW, winH)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(program)
@@ -159,7 +205,8 @@ class VideoPipeline {
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GLES20.glDisableVertexAttribArray(aPos)
         GLES20.glDisableVertexAttribArray(aTex)
-        egl?.swap(window)
+        if (egl?.swap(window) == true) diagnosticSwaps++
+        else Log.w(TAG, "MirrorGL swap failed error=${EGL14.eglGetError()}")
     }
 
     private fun _initGl() {
@@ -178,6 +225,7 @@ class VideoPipeline {
         surfaceTexture = SurfaceTexture(oesTex).also {
             if (videoW > 0 && videoH > 0) it.setDefaultBufferSize(videoW, videoH)
             it.setOnFrameAvailableListener {
+                diagnosticCallbacks++
                 synchronized(lock) { frameAvailable = true; lock.notifyAll() }
             }
         }

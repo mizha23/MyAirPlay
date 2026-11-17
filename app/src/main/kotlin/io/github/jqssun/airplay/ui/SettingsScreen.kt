@@ -30,6 +30,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import io.github.jqssun.airplay.Prefs
 import io.github.jqssun.airplay.R
 import io.github.jqssun.airplay.appSettingsIntent
+import io.github.jqssun.airplay.renderer.VideoRenderer
 import io.github.jqssun.airplay.viewmodel.MainViewModel
 import androidx.compose.ui.res.stringArrayResource
 import androidx.compose.ui.res.stringResource
@@ -68,8 +69,12 @@ fun SettingsScreen(viewModel: MainViewModel) {
     val keyAllowFrameDrop by viewModel.pref(Prefs.KEY_ALLOW_FRAME_DROP).collectAsState()
     val realtimeDecoderPriority by viewModel.pref(Prefs.KEY_PRIORITY).collectAsState()
     val lowLatency by viewModel.pref(Prefs.LOW_LATENCY).collectAsState()
+    val videoLowLatency by viewModel.pref(Prefs.VIDEO_LOW_LATENCY).collectAsState()
+    val ptsMode by viewModel.pref(Prefs.MIRROR_PTS_MODE).collectAsState()
     val operatingRate by viewModel.pref(Prefs.OPERATING_RATE).collectAsState()
     val scheduledOutputBufferRelease by viewModel.pref(Prefs.SCHEDULED_OUTPUT_BUFFER_RELEASE).collectAsState()
+    val mirrorJitterBuffer by viewModel.pref(Prefs.MIRROR_JITTER_BUFFER).collectAsState()
+    val mirrorJitterBufferMs by viewModel.pref(Prefs.MIRROR_JITTER_BUFFER_MS).collectAsState()
     val benchmarkLog by viewModel.pref(Prefs.BENCHMARK_LOG).collectAsState()
     val audioAutoBuffer by viewModel.pref(Prefs.AUDIO_AUTO_BUFFER).collectAsState()
     val audioCushionMs by viewModel.pref(Prefs.AUDIO_CUSHION_MS).collectAsState()
@@ -343,11 +348,57 @@ fun SettingsScreen(viewModel: MainViewModel) {
             )
 
             SettingSwitch(
+                title = stringResource(R.string.setting_video_low_latency),
+                description = stringResource(R.string.setting_video_low_latency_desc),
+                checked = videoLowLatency,
+                onCheckedChange = { viewModel.set(Prefs.VIDEO_LOW_LATENCY, it) }
+            )
+
+            SettingChips(
+                title = stringResource(R.string.setting_mirror_pts_mode),
+                description = stringResource(R.string.setting_mirror_pts_mode_desc),
+                value = ptsMode,
+                options = listOf(
+                    VideoRenderer.PTS_MODE_CONTINUOUS to stringResource(R.string.chip_pts_continuous),
+                    VideoRenderer.PTS_MODE_REBASE to stringResource(R.string.chip_pts_rebase),
+                    VideoRenderer.PTS_MODE_RAW to stringResource(R.string.chip_pts_raw),
+                ),
+                onValueChange = { viewModel.set(Prefs.MIRROR_PTS_MODE, it) }
+            )
+
+            SettingSwitch(
                 title = stringResource(R.string.setting_scheduled_output_buffer_release),
                 description = stringResource(R.string.setting_scheduled_output_buffer_release_desc),
                 checked = scheduledOutputBufferRelease,
                 onCheckedChange = { viewModel.set(Prefs.SCHEDULED_OUTPUT_BUFFER_RELEASE, it) }
             )
+
+            SettingSwitch(
+                title = stringResource(R.string.setting_mirror_jitter_buffer),
+                description = stringResource(R.string.setting_mirror_jitter_buffer_desc),
+                checked = mirrorJitterBuffer,
+                onCheckedChange = { viewModel.set(Prefs.MIRROR_JITTER_BUFFER, it) }
+            )
+
+            if (mirrorJitterBuffer) {
+                var sliderVal by remember(mirrorJitterBufferMs) { mutableFloatStateOf(mirrorJitterBufferMs.toFloat()) }
+                ListItem(
+                    headlineContent = {
+                        Slider(
+                            value = sliderVal,
+                            onValueChange = { sliderVal = it },
+                            onValueChangeFinished = { viewModel.set(Prefs.MIRROR_JITTER_BUFFER_MS, sliderVal.roundToInt()) },
+                            valueRange = 50f..300f,
+                            steps = 4,
+                            modifier = Modifier.dpadFocus().dpadAdjust(
+                                onLeft = { viewModel.set(Prefs.MIRROR_JITTER_BUFFER_MS, (mirrorJitterBufferMs - 25).coerceIn(50, 300)) },
+                                onRight = { viewModel.set(Prefs.MIRROR_JITTER_BUFFER_MS, (mirrorJitterBufferMs + 25).coerceIn(50, 300)) }
+                            )
+                        )
+                    },
+                    trailingContent = { Text(stringResource(R.string.mirror_jitter_buffer_value, sliderVal.roundToInt())) }
+                )
+            }
 
             SettingSwitch(
                 title = stringResource(R.string.setting_audio_delay),

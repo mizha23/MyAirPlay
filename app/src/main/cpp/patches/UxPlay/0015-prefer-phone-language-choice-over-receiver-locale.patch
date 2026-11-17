@@ -1,0 +1,134 @@
+diff --git a/lib/airplay_video.c b/lib/airplay_video.c
+index 6c0a7e0..edf78cc 100644
+--- a/lib/airplay_video.c
++++ b/lib/airplay_video.c
+@@ -484,6 +484,25 @@ fail:
+     return NULL;
+ }
+ 
++/* Does a sender-requested language identifier (MediaSelectionOptions-
++ * UnicodeLanguageIdentifier, e.g. "zh-Hans") match a playlist BCP 47
++ * tag (e.g. "zh-Hans-CN")? A prefix match in either direction counts
++ * (the shorter tag is a prefix of the longer one); otherwise the first
++ * two characters (the primary language subtag) must agree. */
++static bool
++language_code_matches(const char *playlist_code, const char *wanted) {
++    if (!playlist_code || !wanted || !*playlist_code || !*wanted) {
++        return false;
++    }
++    size_t wanted_len = strlen(wanted);
++    size_t playlist_len = strlen(playlist_code);
++    size_t n = wanted_len < playlist_len ? wanted_len : playlist_len;
++    if (strncmp(playlist_code, wanted, n) == 0) {
++        return true;
++    }
++    return strncmp(playlist_code, wanted, 2) == 0;
++}
++
+ char * select_master_playlist_language(airplay_video_t *airplay_video, char *master_playlist) {
+     int language_count, slices;  
+     language_t *languages;
+@@ -504,59 +523,63 @@ char * select_master_playlist_language(airplay_video_t *airplay_video, char *mas
+         return master_playlist;
+     }
+     printf("%d available languages:\n\n", language_count);
+-    int i_default = 1;
+-    
+-    const char *language_name = get_language_name(airplay_video);
+-    for (int i = 1; i <= language_count; i ++) {
+-        if (language_name) {
+-            if (!strcmp(language_name, languages[i].name)) {
+-                i_default = i;
+-            }
+-        } else if (languages[i].is_default) {
+-            i_default = i;
+-        }
+-        printf("%2d %-5.5s \"%s\" %s\n",i, languages[i].code, languages[i].name, (languages[i].is_default ? "(DEFAULT)" : ""));
++    for (int i = 1; i <= language_count; i++) {
++        printf("%2d %-5.5s \"%s\" %s\n", i, languages[i].code, languages[i].name,
++               (languages[i].is_default ? "(DEFAULT)" : ""));
+     }
+     printf("\n");
+-    assert(i_default >= 0);
+ 
+-    const char *ptrc = airplay_video->lang;;
+-    code = NULL;
+-    name = NULL;
+-    while (ptrc){
++    /* Audio-track priority:
++     *   1. the phone's explicit choice, sent as PUT
++     *      /setProperty?selectedMediaArray (MediaSelectionOptionsName /
++     *      MediaSelectionOptionsUnicodeLanguageIdentifier, stored per
++     *      video session by set_language_name/code);
++     *   2. the playlist's DEFAULT=YES track (the original / default
++     *      audio);
++     *   3. the first audio track.
++     * The receiver's own UI locale (airplay_video->lang, set from the
++     * Android device locale) must NEVER force a choice: it used to be
++     * tried first here and overrode both the phone's choice and the
++     * playlist default. */
++    int i_selected = -1;
++    const char *choice_source = NULL;
++    const char *language_name = get_language_name(airplay_video);
++    const char *language_code = get_language_code(airplay_video);
++    if (language_name) {
+         for (int i = 1; i <= language_count; i++) {
+-            if (!strncmp(languages[i].code, ptrc, 2)) {
+-                code = languages[i].code;
+-                name = languages[i].name;
+-                printf("language choice: %s \"%s\" (based on prefered languages list %s)\n\n",
+-                       code, name,  airplay_video->lang);
++            if (languages[i].name && !strcmp(language_name, languages[i].name)) {
++                i_selected = i;
++                choice_source = "phone-selected language";
+                 break;
+             }
+         }
+-        if (code) {
+-            break;
++    }
++    if (i_selected < 0 && language_code) {
++        for (int i = 1; i <= language_count; i++) {
++            if (language_code_matches(languages[i].code, language_code)) {
++                i_selected = i;
++                choice_source = "phone-selected language";
++                break;
++            }
+         }
+-        ptrc = strchr(ptrc,':');
+-        if(ptrc) {
+-            ptrc++;
+-            if (strlen(ptrc) < 2) {
++    }
++    if (i_selected < 0) {
++        for (int i = 1; i <= language_count; i++) {
++            if (languages[i].is_default) {
++                i_selected = i;
++                choice_source = "playlist default language";
+                 break;
+             }
+         }
+     }
++    if (i_selected < 0) {
++        i_selected = 1;
++        choice_source = "first language";
++    }
++    code = languages[i_selected].code;
++    name = languages[i_selected].name;
++    printf("language choice: %s \"%s\" (using %s)\n\n", code, name, choice_source);
+ 
+-    if (!code) {
+-        code = languages[i_default].code;
+-        name = languages[i_default].name; 
+-        if (airplay_video->lang) {
+-            printf("no match with prefered language list %s\n", airplay_video->lang);
+-        }
+-        if (language_name) {
+-            printf("using HLS-specified language choice: %s \"%s\"\n\n", code, name); 
+-        } else {
+-            printf("using default language choice: %s \"%s\"\n\n", code, name);
+-        }
+-    } 
+ 
+     /* update stored language code, name if changed */
+     if (name != language_name) {   /* compare addresses */

@@ -36,9 +36,12 @@ class AirPlayVideoPlayer(private val context: Context) {
     private var clientGain = 1f
 
     var onPlaybackInfo: ((PlaybackSnapshot) -> Unit)? = null
+    private val videoPipeline = VideoPipeline(manageFrameEpoch = false)
+
     var onVideoSize: ((width: Int, height: Int, aspect: Float) -> Unit)? = null
     var onTitle: ((String?) -> Unit)? = null
     var onEnded: (() -> Unit)? = null
+    var onError: ((String) -> Unit)? = null
 
     private val _reportTick = object : Runnable {
         override fun run() {
@@ -49,11 +52,14 @@ class AirPlayVideoPlayer(private val context: Context) {
 
     private val _listener = object : Player.Listener {
         override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-            Log.w(TAG, "playback error", error)
-            onEnded?.invoke()
+            Log.w(TAG, "playback error code=${error.errorCodeName} positionMs=${player?.currentPosition} durationMs=${player?.duration}", error)
+            onError?.invoke(error.errorCodeName)
         }
         override fun onPlaybackStateChanged(state: Int) {
-            if (state == Player.STATE_ENDED) onEnded?.invoke()
+            if (state == Player.STATE_ENDED) {
+                Log.i(TAG, "Direct video reached end positionMs=${player?.currentPosition} durationMs=${player?.duration}")
+                onEnded?.invoke()
+            }
         }
         override fun onTimelineChanged(timeline: Timeline, reason: Int) {
             // duration is usually established here (esp. hls): report so the held /play releases
@@ -64,6 +70,8 @@ class AirPlayVideoPlayer(private val context: Context) {
         }
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             if (videoSize.height == 0) return
+            Log.i(TAG, "Direct video size ${videoSize.width}x${videoSize.height} pixelRatio=${videoSize.pixelWidthHeightRatio}")
+            videoPipeline.setVideoSize(videoSize.width, videoSize.height)
             val width = (videoSize.width * videoSize.pixelWidthHeightRatio).toInt()
             onVideoSize?.invoke(width, videoSize.height, width.toFloat() / videoSize.height)
         }
@@ -72,9 +80,11 @@ class AirPlayVideoPlayer(private val context: Context) {
     fun play(location: String, startPositionSeconds: Float) = mainHandler.post {
         // recycling must not report the stopped sentinel: senders poll right after /play
         _stopInternal(reportStopped = false)
+        videoPipeline.start()
         val p = ExoPlayer.Builder(context).build().also {
             it.addListener(_listener)
-            pendingSurface?.let { s -> it.setVideoSurface(s) }
+            pendingSurface?.let { s -> videoPipeline.setDisplaySurface(s) }
+            it.setVideoSurface(videoPipeline.inputSurface)
             it.volume = clientGain
         }
         player = p
@@ -135,16 +145,23 @@ class AirPlayVideoPlayer(private val context: Context) {
         p.seekTo(target)
     }
 
-    fun setSurface(surface: Surface) = mainHandler.post {
-        pendingSurface = surface
-        player?.setVideoSurface(surface)
+    fun setSurface(surface: Surface) {
+        val attach = Runnable {
+            pendingSurface = surface
+            videoPipeline.setDisplaySurface(surface)
+        }
+        if (Looper.myLooper() == mainHandler.looper) attach.run() else mainHandler.post(attach)
     }
 
     // no-op if a newer surface already replaced this one
-    fun clearSurface(surface: Surface) = mainHandler.post {
-        if (pendingSurface !== surface) return@post
-        pendingSurface = null
-        player?.setVideoSurface(null)
+    fun clearSurface(surface: Surface) {
+        val clear = Runnable {
+            if (pendingSurface === surface) {
+                pendingSurface = null
+                videoPipeline.setDisplaySurface(null)
+            }
+        }
+        if (Looper.myLooper() == mainHandler.looper) clear.run() else mainHandler.post(clear)
     }
 
     fun stop() = mainHandler.post { _stopInternal(reportStopped = true) }
@@ -156,6 +173,7 @@ class AirPlayVideoPlayer(private val context: Context) {
             it.release()
         }
         player = null
+        videoPipeline.release()
         // duration=-1 is the "video finished" sentinel for the playback-info handler
         if (reportStopped) {
             onPlaybackInfo?.invoke(PlaybackSnapshot(0f, -1f, 0f, false, false))

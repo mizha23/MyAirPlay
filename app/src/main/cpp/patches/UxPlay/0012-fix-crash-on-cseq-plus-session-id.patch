@@ -1,0 +1,56 @@
+diff --git a/lib/raop.c b/lib/raop.c
+index 07564e1..758003f 100644
+--- a/lib/raop.c
++++ b/lib/raop.c
+@@ -329,6 +329,23 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
+         }	  
+     }
+ 
++    /* A new connection may present both CSeq and X-Apple-Session-ID
++     * (e.g. a server-info query). The CSeq branch above classifies
++     * such a connection as RAOP without storing the session id, but
++     * the check below compares the presented id against the stored
++     * one. Store any presented session id here so that no header
++     * combination can leave conn->client_session_id NULL while a
++     * session id is presented. A connection that was classified
++     * earlier (e.g. RAOP by a CSeq-only first request) and only
++     * later presents a session id is covered as well, because this
++     * runs on every request. */
++    if (client_session_id && !conn->client_session_id) {
++        conn->client_session_id = (char *) calloc(strlen(client_session_id) + 1, sizeof(char));
++        if (conn->client_session_id) {
++            memcpy(conn->client_session_id, client_session_id, strlen(client_session_id));
++        }
++    }
++
+     /* this response code and message  will be modified by the handler if necessary */
+     *response = http_response_create();
+     http_response_init(*response, protocol, 200, "OK");
+@@ -397,7 +414,26 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
+     }
+     
+     if (client_session_id) {
+-        assert(!strcmp(client_session_id, conn->client_session_id));
++        /* Never dereference a NULL stored session id: a request may
++         * present a session id that this connection has not stored
++         * (e.g. it was classified as RAOP by a CSeq-only first
++         * request and only later presented a session id). The store
++         * above normally covers this, but a mismatch or a failed
++         * allocation must still be a clean rejection, not a crash:
++         * the bare strcmp(NULL) here used to SIGSEGV the whole
++         * service when a new connection presented both CSeq and
++         * X-Apple-Session-ID. */
++        if (!conn->client_session_id) {
++            logger_log(raop->logger, LOGGER_ERR, "request with X-Apple-Session-ID on connection with no stored session id");
++            http_response_init(*response, protocol, 400, "Bad Request");
++            goto finish;
++        }
++        if (strcmp(client_session_id, conn->client_session_id)) {
++            logger_log(raop->logger, LOGGER_ERR, "X-Apple-Session-ID mismatch: presented %s, stored %s",
++                       client_session_id, conn->client_session_id);
++            http_response_init(*response, protocol, 400, "Bad Request");
++            goto finish;
++        }
+     }
+ 
+     logger_log(raop->logger, LOGGER_DEBUG, "Handling request %s with URL %s", method, url);

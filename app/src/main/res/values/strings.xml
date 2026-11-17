@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">AirPlay Server</string>
+    <string name="app_name">MyAirplay</string>
 
     <!-- Notification -->
-    <string name="notification_channel">AirPlay Service</string>
-    <string name="notification_title">AirPlay Server Running</string>
+    <string name="notification_channel">MyAirplay Service</string>
+    <string name="notification_title">MyAirplay Running</string>
     <string name="notification_text">Accepting AirPlay connections</string>
     <string name="notification_pin_title">AirPlay PIN Required</string>
     <string name="notification_pin_text">PIN: %1$s</string>
@@ -164,8 +164,18 @@
     <string name="chip_off">Off</string>
     <string name="setting_low_latency">Low latency</string>
     <string name="setting_low_latency_desc">Use low-latency audio decoding for output; this uses more power and CPU</string>
+    <string name="setting_video_low_latency">Video low-latency parameters</string>
+    <string name="setting_video_low_latency_desc">Apply vendor low-latency parameters when configuring the video decoder (low-latency, vdec-lowlatency, vendor.low-latency.enable). Off means a plain decoder config, for A/B testing whether they wedge the decoder. The Low latency switch is audio-only.</string>
+    <string name="setting_mirror_pts_mode">Mirror PTS mode</string>
+    <string name="setting_mirror_pts_mode_desc">How sender timestamps are fed to the video decoder. Continuous (default): synthetic timestamps from session start, strictly increasing. Round 3 rebase: first valid PTS anchors to now, pre-sync frames feed as 0. Raw: sender timestamps unchanged. For A/B testing which change caused the black screen; changing it restarts the server.</string>
+    <string name="chip_pts_continuous">Continuous</string>
+    <string name="chip_pts_rebase">Rebase</string>
+    <string name="chip_pts_raw">Raw</string>
     <string name="setting_scheduled_output_buffer_release">Aligned frame pacing</string>
     <string name="setting_scheduled_output_buffer_release_desc">Schedule each decoded frame to the VSYNC matching its presentation timestamp</string>
+    <string name="setting_mirror_jitter_buffer">Mirror jitter buffer</string>
+    <string name="setting_mirror_jitter_buffer_desc">Hold incoming mirror frames briefly and feed the decoder on presentation-time schedule to smooth bursty arrival</string>
+    <string name="mirror_jitter_buffer_value">%dms</string>
     <string name="setting_audio_delay">Override audio delay</string>
     <string name="setting_audio_delay_desc">Set a custom audio latency reported to sender</string>
     <string name="audio_delay_value">%dms</string>
@@ -196,6 +206,14 @@
     <string name="debug_fps_bitrate">FPS: %1$d  Bitrate: %2$s</string>
     <string name="debug_frames_drops">Frames: %1$d  Drops: %2$d</string>
     <string name="debug_jitter">Jitter: %1$s</string>
+    <string name="debug_section_mirror">Mirror diagnostics</string>
+    <string name="debug_mirror_fps">In: %1$d fps  Out: %2$d fps</string>
+    <string name="debug_mirror_jitter">Jitter out: %1$s  in: %2$s  pts: %3$s</string>
+    <string name="debug_mirror_feed">feedFrame: %1$.1f / %2$.1f ms (mean/max)</string>
+    <string name="debug_mirror_res">Advertised: %1$s @%2$d  Actual: %3$s  Decoded: %4$s</string>
+    <string name="debug_mirror_drain">Drain: released=%1$d errors=%2$d</string>
+    <string name="debug_mirror_drain_err">Drain last error: %1$s</string>
+    <string name="debug_mirror_curve">Intervals (ms) — grey: arrival, green: output, red: 33.3ms</string>
     <string name="debug_audio">%1$s  Receiver: %2$d%%  Sender: %3$d%%</string>
     <string name="debug_audio_buffer">Buffer: %1$d ms (tgt: %2$d ms)</string>
     <string name="debug_audio_glitch">Glitch: trim=%1$d drop=%2$d sil=%3$d ur=%4$d xrun=%5$d</string>

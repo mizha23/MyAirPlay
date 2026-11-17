@@ -1,0 +1,364 @@
+--- a/lib/http_handlers.h
++++ b/lib/http_handlers.h
+@@ -22,13 +22,19 @@
+ static void
+ *hls_get_current_video(raop_t *raop) {
+     if (raop->current_video < 0) {
+         logger_log(raop->logger, LOGGER_ERR, "hls_get_current_video: failed to identify current_playlist");
+         return NULL;
+     }
+-    assert(raop->airplay_video[raop->current_video]);
++    if (!raop->airplay_video[raop->current_video]) {
++        /* The slot was destroyed without a current video (e.g. the
++         * playlist was evicted): treat as "no current video"
++         * instead of crashing on the assert. */
++        logger_log(raop->logger, LOGGER_ERR, "hls_get_current_video: current_video slot is empty");
++        return NULL;
++    }
+     return (void *) raop->airplay_video[raop->current_video];
+ }
+ 
+ static int
+ get_playlist_by_uuid(raop_t *raop, const char *uuid) {
+     for (int i = 0 ;i < MAX_AIRPLAY_VIDEO; i++) {
+@@ -194,13 +200,21 @@
+         reverseEndTime   (only used when rate < 0) time at which reverse playback ends
+         forwardEndTime   (only used when rate > 0) time at which reverse playback ends
+         selectedMediaArray contains plist with language choice:
+     */
+ 
+     airplay_video_t *airplay_video = (airplay_video_t *) hls_get_current_video(raop);
+-    assert(airplay_video);
++    if (!airplay_video) {
++        /* No active video session (e.g. the client sends a property
++         * update after the playlist ended or was removed): answer
++         * cleanly instead of crashing on the assert. */
++        logger_log(raop->logger, LOGGER_ERR,
++                   "http_handler_set_property: no current video for property %s", property);
++        http_response_init(response, "HTTP/1.1", 400, "Bad Request");
++        return;
++    }
+     if (!strcmp(property, "selectedMediaArray")) {
+         /* verify that this request contains a binary plist*/
+         char *header_str = NULL;
+         int request_datalen = 0;
+         http_request_get_header_string(request, &header_str);
+         bool is_plist = strstr(header_str,"apple-binary-plist");
+@@ -497,13 +511,17 @@
+ 
+     const char* session_id = http_request_get_header(request, "X-Apple-Session-ID");
+     if (!session_id) {
+         logger_log(raop->logger, LOGGER_ERR, "Play request had no X-Apple-Session-ID");
+         goto post_action_error;
+     }    
+-    const char *apple_session_id = get_apple_session_id(airplay_video);
++    const char* apple_session_id = get_apple_session_id(airplay_video);
++    if (!apple_session_id) {
++        logger_log(raop->logger, LOGGER_ERR, "no stored X-Apple-Session-ID for this playlist");
++        goto post_action_error;
++    }
+     if (strcmp(session_id, apple_session_id)){
+         logger_log(raop->logger, LOGGER_ERR, "X-Apple-Session-ID has changed:\n  was:\"%s\"\n  now:\"%s\"",
+                    apple_session_id, session_id);
+         goto post_action_error;
+     }
+ 
+@@ -556,13 +574,16 @@
+         if (!req_params_item_node || !PLIST_IS_DICT (req_params_item_node)) {
+             goto post_action_error;
+         }
+         plist_t req_params_item_uuid_node = plist_dict_get_item(req_params_item_node, "uuid");
+         char* remove_uuid = NULL;
+         plist_get_string_val(req_params_item_uuid_node, &remove_uuid);
+-        assert(remove_uuid);
++        if (!remove_uuid) {
++            logger_log(raop->logger, LOGGER_ERR, "playlistRemove without uuid");
++            goto post_action_error;
++        }
+         int id  =  get_playlist_by_uuid(raop, remove_uuid);
+         if (id == raop->current_video) {
+             raop->current_video = -1;
+             float position = raop->callbacks.on_video_playlist_remove(raop->callbacks.cls);
+             /* keep the playlist (until space is needed for another one) in case its playback_uuid is re-requested
+                the video will then be restarted at its previous position */
+@@ -783,13 +804,19 @@
+     if (id >= 0) {
+       //printf("====use EXISTING  airplay_video[%d] %p %s %s\n", id, raop->airplay_video[id], playback_uuid, get_playback_uuid(raop->airplay_video[id]));
+         free(playback_uuid);
+         free(playback_location);
+         raop->current_video = id;
+         airplay_video = hls_get_current_video(raop);
+-        assert(airplay_video);
++        if (!airplay_video) {
++            /* The slot was verified just above, but never dereference
++             * a NULL video: fail the request instead of crashing. */
++            logger_log(raop->logger, LOGGER_ERR, "start_playback: current video vanished");
++            http_response_init(response, "HTTP/1.1", 400, "Bad Request");
++            return;
++        }
+         set_apple_session_id(airplay_video, apple_session_id, strlen(apple_session_id));
+         float resume_pos = get_resume_position_seconds(airplay_video);
+         float start_pos = get_start_position_seconds(airplay_video);
+ 	//printf("========= %f ============call on_video_play===== %f ==========\n", start_pos, resume_pos);
+         raop->callbacks.on_video_play(raop->callbacks.cls,
+                                       get_playback_location(airplay_video),
+@@ -817,28 +844,54 @@
+             } else {
+                 count++;
+             }
+         }
+     }
+ 
+-    assert (count < MAX_AIRPLAY_VIDEO);
+-    assert(id == -1);
++    /* All slots may legitimately be full after many videos in one
++     * session (each distinct uuid keeps a stored playlist): evict
++     * the oldest non-current playlist instead of crashing on the
++     * assert. */
++    if (count >= MAX_AIRPLAY_VIDEO) {
++        for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
++            int evict = (raop->current_video + 1 + i) % MAX_AIRPLAY_VIDEO;
++            if (raop->airplay_video[evict]) {
++                const char *evict_uuid = get_playback_uuid(raop->airplay_video[evict]);
++                logger_log(raop->logger, LOGGER_INFO,
++                           "evicting playlist playback_uuid %s to make room for a new video",
++                           evict_uuid ? evict_uuid : "(none)");
++                raop_destroy_airplay_video(raop, evict);
++                count--;
++                break;
++            }
++        }
++    }
++    if (count >= MAX_AIRPLAY_VIDEO || id != -1) {
++        goto play_error;
++    }
+     /* initialize new airplay_video structure to hold playlist */
+     for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
+         if (raop->airplay_video[i]) {
+             continue;
+         }
+         id = i;
+         break;
+     }
+-    assert(id >= 0);
++    if (id < 0) {
++        goto play_error;
++    }
+ 
+     raop->current_video = id;
+     raop->airplay_video[id] = airplay_video_init(raop, raop->port, raop->lang);
+     airplay_video = hls_get_current_video(raop);
+-    assert(airplay_video);
++    if (!airplay_video) {
++        /* airplay_video_init returns NULL on allocation failure. */
++        logger_log(raop->logger, LOGGER_ERR, "start_playback: failed to create airplay_video");
++        raop->current_video = -1;
++        goto play_error;
++    }
+     set_apple_session_id(airplay_video, apple_session_id, strlen(apple_session_id));
+     set_playback_uuid(airplay_video, playback_uuid, strlen(playback_uuid));
+     free(playback_uuid);
+     playback_uuid = NULL;
+     count++;
+ 
+@@ -961,12 +1014,20 @@
+ 
+     const char* apple_session_id = http_request_get_header(request, "X-Apple-Session-ID");
+     if (!apple_session_id) {
+         logger_log(raop->logger, LOGGER_ERR, "Play request had no X-Apple-Session-ID");
+         goto play_error;
+     }
++    if (strlen(apple_session_id) != 36) {
++        /* set_apple_session_id() requires a 36-character UUID;
++         * reject a malformed id here instead of crashing on its
++         * assert. */
++        logger_log(raop->logger, LOGGER_ERR, "Play request had invalid X-Apple-Session-ID length %zu",
++                   strlen(apple_session_id));
++        goto play_error;
++    }
+ 
+     int request_datalen = -1;    
+     const char *request_data = http_request_get_data(request, &request_datalen);
+     if (request_datalen <= 0) {
+         goto play_error;
+     }
+@@ -1038,12 +1099,19 @@
+         goto play_error;
+     }
+ 
+     if (!playback_uuid) {
+         playback_uuid = strdup(apple_session_id);
+     }
++    if (strlen(playback_uuid) != 36) {
++        /* set_playback_uuid() requires a 36-character UUID; reject
++         * a malformed uuid here instead of crashing on its assert. */
++        logger_log(raop->logger, LOGGER_ERR, "Play request had invalid playback uuid length %zu",
++                   strlen(playback_uuid));
++        goto play_error;
++    }
+ 
+ #if 0
+     for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
+         printf("old: airplay_video[%d] %p %s %f\n", i, raop->airplay_video[i],
+ 	       get_playback_uuid(raop->airplay_video[i]),
+ 	       get_duration(raop->airplay_video[i]));
+@@ -1084,26 +1152,34 @@
+     if (raop->current_video == -1) {
+         logger_log(raop->logger, LOGGER_ERR,"airplay_video playlist  not found");
+         http_response_init(response, "HTTP/1.1", 404, "Not Found");
+         return;
+     }
+     const char *method = http_request_get_method(request);
+-    assert (!strcmp(method, "GET"));
++    if (strcmp(method, "GET")) {
++        logger_log(raop->logger, LOGGER_ERR, "hls handler got non-GET method %s", method);
++        http_response_init(response, "HTTP/1.1", 405, "Method Not Allowed");
++        return;
++    }
+     const char *url = http_request_get_url(request);    
+     const char* upgrade = http_request_get_header(request, "Upgrade");
+     if (upgrade) {
+         //don't accept Upgrade: h2c request ?
+         char *header_str = NULL;
+         http_request_get_header_string(request, &header_str);
+         logger_log(raop->logger, LOGGER_INFO,
+                    "%s\nhls upgrade request declined", header_str); 
+         free (header_str);
+         return;
+     }
+     airplay_video_t *airplay_video = (airplay_video_t *) hls_get_current_video(raop);
+-    assert(airplay_video);
++    if (!airplay_video) {
++        logger_log(raop->logger, LOGGER_ERR, "hls handler: no current video");
++        http_response_init(response, "HTTP/1.1", 404, "Not Found");
++        return;
++    }
+     if (!strcmp(url, "/master.m3u8")){
+         char * master_playlist  = get_master_playlist(airplay_video);
+         if (master_playlist) {
+             *response_data = master_playlist;
+             *response_datalen = (int) strlen(master_playlist);
+         } else {
+--- a/lib/airplay_video.c
++++ b/lib/airplay_video.c
+@@ -158,13 +158,15 @@
+     }
+     free (airplay_video);
+     airplay_video = NULL;
+ }
+ 
+ void set_apple_session_id(airplay_video_t *airplay_video, const char * apple_session_id, size_t len) {
+-    assert(apple_session_id && len == 36);
++    if (!airplay_video || !apple_session_id || len != 36) {
++        return;
++    }
+     char *str = (char *) calloc(len + 1, sizeof(char));
+     if (!str) {
+         printf("Memory allocation failed (str)\n");
+         exit(1);
+     }
+     strncpy(str, apple_session_id, len);
+@@ -173,13 +175,15 @@
+     }
+     airplay_video->apple_session_id = str;
+     str = NULL;
+ }
+ 
+ void set_playback_uuid(airplay_video_t *airplay_video, const char *playback_uuid, size_t len) {
+-    assert(playback_uuid && len == 36);
++    if (!airplay_video || !playback_uuid || len != 36) {
++        return;
++    }
+     char *str = (char *) calloc(len + 1, sizeof(char));
+     if (!str) {
+         printf("Memory allocation failed (str)\n");
+         exit(1);
+     }
+     strncpy(str, playback_uuid, len);
+@@ -188,13 +192,15 @@
+     }
+     airplay_video->playback_uuid = str;
+     str = NULL;
+ }
+ 
+ void set_uri_prefix(airplay_video_t *airplay_video, const char *uri_prefix, size_t len) {
+-    assert(uri_prefix && len );
++    if (!airplay_video || !uri_prefix || len == 0) {
++        return;
++    }
+     char *str = (char *) calloc(len + 1, sizeof(char));
+     if (!str) {
+         printf("Memory allocation failed (str)\n");
+         exit(1);
+     }
+     strncpy(str, uri_prefix, len);
+@@ -203,13 +209,15 @@
+     }
+     airplay_video->uri_prefix = str;
+     str = NULL;
+ }
+ 
+ void set_playback_location(airplay_video_t *airplay_video, const char *location, size_t len) {
+-    assert(location && len );
++    if (!airplay_video || !location || len == 0) {
++        return;
++    }
+     char *str = (char *) calloc(len + 1, sizeof(char));
+     if (!str) {
+         printf("Memory allocation failed (str)\n");
+         exit(1);
+     }
+     strncpy(str, location, len);
+@@ -218,13 +226,15 @@
+     }
+     airplay_video->playback_location = str;
+     str = NULL;
+ }
+ 
+ void set_language_name(airplay_video_t *airplay_video, const char *language_name, size_t len) {
+-    assert(language_name && len );
++    if (!airplay_video || !language_name || len == 0) {
++        return;
++    }
+     char *str = (char *) calloc(len + 1, sizeof(char));
+     if (!str) {
+         printf("Memory allocation failed (str)\n");
+         exit(1);
+     }
+     strncpy(str, language_name, len);
+@@ -233,13 +243,15 @@
+     }
+     airplay_video->language_name = str;
+     str = NULL;
+ }
+ 
+ void set_language_code(airplay_video_t *airplay_video, const char *language_code, size_t len) {
+-    assert(language_code && len );
++    if (!airplay_video || !language_code || len == 0) {
++        return;
++    }
+     char *str = (char *) calloc(len + 1, sizeof(char));
+     if (!str) {
+         printf("Memory allocation failed (str)\n");
+         exit(1);
+     }
+     strncpy(str, language_code, len);
+@@ -483,13 +495,17 @@
+ 
+     /* audio is offered in multiple languages */ 
+ 
+     char *code = NULL;
+     char *name = NULL;
+ 
+-    assert(airplay_video);
++    if (!airplay_video) {
++        /* No video context: return the playlist unchanged instead
++         * of crashing; language selection is skipped. */
++        return master_playlist;
++    }
+     printf("%d available languages:\n\n", language_count);
+     int i_default = 1;
+     
+     const char *language_name = get_language_name(airplay_video);
+     for (int i = 1; i <= language_count; i ++) {
+         if (language_name) {

@@ -1,0 +1,405 @@
+diff --git a/lib/http_handlers.h b/lib/http_handlers.h
+--- a/lib/http_handlers.h
++++ b/lib/http_handlers.h
+@@ -39,6 +39,15 @@
+     return -1;
+ }
+ 
++/* Defined below, just before http_handler_play. POST /play and POST /action
++ * playlistInsert share it: start (or resume) playback of the item
++ * identified by playback_uuid at playback_location. Takes ownership of
++ * playback_location and playback_uuid (frees them). A NULL/empty location
++ * means resume-only: the playlist must already be stored. */
++static void start_playback(raop_t *raop, raop_conn_t *conn, http_response_t *response,
++                           const char *apple_session_id, char *playback_location,
++                           char *playback_uuid, float start_position_seconds);
++
+ static void
+ http_handler_server_info(raop_conn_t *conn, http_request_t *request, http_response_t *response,
+                          char **response_data, int *response_datalen)  {
+@@ -562,23 +571,34 @@
+             goto post_action_error;
+         }
+         plist_t req_params_item_uuid_node = plist_dict_get_item(req_params_item_node, "uuid");
+-        char* remove_uuid = NULL;
+-        plist_get_string_val(req_params_item_uuid_node, &remove_uuid);
+-        if (remove_uuid) {
+-            int id  =  get_playlist_by_uuid(raop, remove_uuid);
+-            if (id >= 0) {
+-                logger_log(raop->logger, LOGGER_INFO, "playlistInsert uuid %s is stored at airplay_video[%d]", remove_uuid, id);
+-            } else {
+-                logger_log(raop->logger, LOGGER_INFO, "playlistInsert uuid %s is not a stored playlist", remove_uuid);
+-            }
+-            plist_mem_free(remove_uuid);
+-            char *plist_xml = NULL;
+-            uint32_t plist_len = 0;
+-            plist_to_xml(req_params_item_node, &plist_xml, &plist_len);
+-            printf("playlistInsert parameter item list is:\n%s", plist_xml);
+-            plist_mem_free(plist_xml);
++        char *insert_uuid = NULL;
++        plist_get_string_val(req_params_item_uuid_node, &insert_uuid);
++        if (!insert_uuid || !strlen(insert_uuid)) {
++            logger_log(raop->logger, LOGGER_ERR, "playlistInsert item has no uuid");
++            plist_mem_free(insert_uuid);
++            goto post_action_error;
+         }
+-        logger_log(raop->logger, LOGGER_ERR, "FIXME: playlistInsert is not yet implemented");
++        /* A stored playlist resumes from where it left off; a new item goes
++         * through the same start-up path as POST /play (FCUP for HLS). */
++        char *insert_location = NULL;
++        plist_t req_params_item_loc_node = plist_dict_get_item(req_params_item_node, "Content-Location");
++        if (req_params_item_loc_node) {
++            plist_get_string_val(req_params_item_loc_node, &insert_location);
++        }
++        float insert_start = 0.0f;
++        plist_t insert_start_node = plist_dict_get_item(req_params_item_node, "Start-Position-Seconds");
++        if (!insert_start_node) {
++            insert_start_node = plist_dict_get_item(req_params_item_node, "Start-Position");
++        }
++        if (insert_start_node) {
++            double insert_start_pos = 0.0;
++            plist_get_real_val(insert_start_node, &insert_start_pos);
++            insert_start = (float) insert_start_pos;
++        }
++        logger_log(raop->logger, LOGGER_INFO, "playlistInsert uuid %s location %s",
++                   insert_uuid, insert_location ? insert_location : "(stored only)");
++        start_playback(raop, conn, response, session_id,
++                       insert_location, insert_uuid, insert_start);
+ 
+     } else if (!strcmp(type, "unhandledURLResponse")) {   
+         /* handling type "unhandledURLResponse" */
+@@ -727,6 +747,177 @@
+ 
+ }
+ 
++/* Start (or resume) playback of the item identified by playback_uuid at
++ * playback_location. Shared by POST /play and POST /action playlistInsert.
++ * Takes ownership of playback_location and playback_uuid (frees them).
++ * A NULL/empty location means resume-only: the playlist must already be
++ * stored, otherwise this fails with 400. */
++static void
++start_playback(raop_t *raop, raop_conn_t *conn, http_response_t *response,
++               const char *apple_session_id, char *playback_location,
++               char *playback_uuid, float start_position_seconds) {
++    int id = -1;
++    airplay_video_t *airplay_video = NULL;
++
++    /* With no location this is a resume-only request (playlistInsert for
++     * a stored playlist); starting something new needs a location. */
++    if (playback_location && strlen(playback_location)) {
++        id = get_playlist_by_uuid(raop, playback_uuid);
++        if (id >= 0 && !get_playback_location(raop->airplay_video[id])) {
++            raop_destroy_airplay_video(raop, id);
++            id = -1;
++        }
++    } else {
++        id = get_playlist_by_uuid(raop, playback_uuid);
++    }
++
++    /* check if playlist is already downloaded and stored (may have been interrupted by advertisements ) */
++    if (id >= 0) {
++      //printf("====use EXISTING  airplay_video[%d] %p %s %s\n", id, raop->airplay_video[id], playback_uuid, get_playback_uuid(raop->airplay_video[id]));
++        free(playback_uuid);
++        free(playback_location);
++        raop->current_video = id;
++        airplay_video = hls_get_current_video(raop);
++        assert(airplay_video);
++        set_apple_session_id(airplay_video, apple_session_id, strlen(apple_session_id));
++        float resume_pos = get_resume_position_seconds(airplay_video);
++        float start_pos = get_start_position_seconds(airplay_video);
++	//printf("========= %f ============call on_video_play===== %f ==========\n", start_pos, resume_pos);
++        raop->callbacks.on_video_play(raop->callbacks.cls,
++                                      get_playback_location(airplay_video),
++                                      resume_pos > start_pos ? resume_pos : start_pos);
++        return;
++    }
++    
++    if (!playback_location || !strlen(playback_location)) {
++        logger_log(raop->logger, LOGGER_ERR,
++                   "no Content-Location for unknown playlist uuid %s", playback_uuid);
++        goto play_error;
++    }
++
++    /* initialize a new playlist (airplay_video structure) */
++    /* first delete any short stored playlists (probably advertisements */
++    int count = 0;
++    for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
++        if (raop->airplay_video[i]) {
++            float duration = get_duration(raop->airplay_video[i]); 
++            if (duration < (float) MIN_STORED_AIRPLAY_VIDEO_DURATION_SECONDS ) { //likely to be an advertisement
++                logger_log(raop->logger, LOGGER_INFO,
++                          "deleting playlist playback_uuid %s duration (seconds) %f",
++                           get_playback_uuid(raop->airplay_video[i]), duration);
++                raop_destroy_airplay_video(raop, i);
++            } else {
++                count++;
++            }
++        }
++    }
++
++    assert (count < MAX_AIRPLAY_VIDEO);
++    assert(id == -1);
++    /* initialize new airplay_video structure to hold playlist */
++    for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
++        if (raop->airplay_video[i]) {
++            continue;
++        }
++        id = i;
++        break;
++    }
++    assert(id >= 0);
++
++    raop->current_video = id;
++    raop->airplay_video[id] = airplay_video_init(raop, raop->port, raop->lang);
++    airplay_video = hls_get_current_video(raop);
++    assert(airplay_video);
++    set_apple_session_id(airplay_video, apple_session_id, strlen(apple_session_id));
++    set_playback_uuid(airplay_video, playback_uuid, strlen(playback_uuid));
++    free(playback_uuid);
++    playback_uuid = NULL;
++    count++;
++
++    /* ensure that space will always be available for adding future playlists */
++
++    if (count == MAX_AIRPLAY_VIDEO) {
++        int next = (id + 1) % (int) MAX_AIRPLAY_VIDEO;
++        logger_log(raop->logger, LOGGER_INFO,
++                   "deleting playlist playback_uuid %s duration (seconds) %f",
++                   get_playback_uuid(raop->airplay_video[next]),
++                   get_duration(raop->airplay_video[next]));
++        airplay_video_destroy(raop->airplay_video[next]);
++        raop->airplay_video[next] = NULL;
++    }
++#if 0    
++    for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
++        printf("new: airplay_video[%d] %p %s %f\n", i, raop->airplay_video[i],
++	       get_playback_uuid(raop->airplay_video[i]),
++	       get_duration(raop->airplay_video[i]));
++    }
++#endif
++
++    set_start_position_seconds(airplay_video, (float) start_position_seconds);
++
++    /* we only support HLS if the playback location is terminated by "/master.m3u8" */
++    const char *uri_suffix = strstr(playback_location, "/master.m3u8");
++    if (uri_suffix) {
++        size_t len = strlen(get_uri_local_prefix(airplay_video)) + strlen(uri_suffix);
++        char *location = (char *) calloc(len + 1, sizeof(char));
++        if (!location) {
++            printf("Memory allocation failed (location)\n");
++            exit(1);
++        }
++        strcat(location, get_uri_local_prefix(airplay_video));
++        strcat(location, uri_suffix);
++        set_playback_location(airplay_video, location, strlen(location));
++        free(location);
++        char *uri_prefix = (char *) calloc(strlen(playback_location) + 1, sizeof(char));
++        if (!playback_location) {
++            printf("Memeory allocation failed (playback_location)\n");
++            exit(1);
++        }
++        strcat(uri_prefix, playback_location);
++        char *end = strstr(uri_prefix, "/master.m3u8");
++        *end = '\0';						  
++        set_uri_prefix(airplay_video, uri_prefix, strlen(uri_prefix));
++        free (uri_prefix);
++        set_next_media_uri_id(airplay_video, 0);
++        if (fcup_request((void *) conn, playback_location, apple_session_id,
++                         get_next_FCUP_RequestID(airplay_video)) != 0) {
++            /* No reverse (PTTH) connection from the sender, so the master
++             * playlist can never arrive: say so loudly and drop the empty
++             * playlist entry instead of returning 200 and stalling. */
++            logger_log(raop->logger, LOGGER_ERR,
++                       "FCUP request failed for session %s, Content-Location %s: "
++                       "no reverse (PTTH) connection from sender; video will not start",
++                       apple_session_id, playback_location);
++            raop_destroy_airplay_video(raop, id);
++            goto play_error;
++        }
++    } else if (!strncmp(playback_location, "http://", strlen("http://")) ||
++               !strncmp(playback_location, "https://", strlen("https://"))) {
++        set_playback_location(airplay_video, playback_location, strlen(playback_location));
++        raop->callbacks.on_video_play(raop->callbacks.cls,
++                                      get_playback_location(airplay_video),
++                                      start_position_seconds);
++        raop->callbacks.on_video_wait_ready(raop->callbacks.cls);
++    } else {
++        logger_log(raop->logger, LOGGER_ERR, "Content-Location has unsupported form:\n%s\n", playback_location);
++        goto play_error;
++    }
++
++    raop->video_play_conn = (void *) conn;
++
++    free(playback_location);
++    return;
++
++ play_error:;
++    free(playback_location);
++    free(playback_uuid);
++    if (id >= 0 && raop->airplay_video[id] && !get_playback_location(raop->airplay_video[id])) {
++        raop_destroy_airplay_video(raop, id);
++    }
++    logger_log(raop->logger, LOGGER_ERR, "Could not find valid Plist Data for POST/play request, Unhandled");
++    http_response_init(response, "HTTP/1.1", 400, "Bad Request");
++}
++
+ /* The POST /play request from the Client to Server on the AirPlay http channel contains (among other information)
+    the "Content Location" that specifies the HLS Playlists for the video to be streamed, as well as the video 
+    "start position in seconds".   Once this request is received by the Sever, the Server sends a POST /event
+@@ -757,8 +948,6 @@
+     float start_position_seconds = 0.0f;
+     bool data_is_binary_plist = false;
+     char supported_hls_proc_names[] = "YouTube;";
+-    airplay_video_t *airplay_video = NULL;
+-    int id = -1;
+     
+     logger_log(raop->logger, LOGGER_DEBUG, "http_handler_play");
+ 
+@@ -855,135 +1044,8 @@
+     printf("new playback_uuid %s\n\n", playback_uuid);
+ #endif
+ 
+-    id = get_playlist_by_uuid(raop, playback_uuid);
+-
+-    if (id >= 0 && !get_playback_location(raop->airplay_video[id])) {
+-        raop_destroy_airplay_video(raop, id);
+-        id = -1;
+-    }
+-
+-    /* check if playlist is already downloaded and stored (may have been interrupted by advertisements ) */
+-    if (id >= 0) {
+-      //printf("====use EXISTING  airplay_video[%d] %p %s %s\n", id, raop->airplay_video[id], playback_uuid, get_playback_uuid(raop->airplay_video[id]));
+-        free(playback_uuid);
+-        free(playback_location);
+-        if (req_root_node) {
+-            plist_free(req_root_node);
+-        }
+-        raop->current_video = id;
+-        airplay_video = hls_get_current_video(raop);
+-        assert(airplay_video);
+-        set_apple_session_id(airplay_video, apple_session_id, strlen(apple_session_id));
+-        float resume_pos = get_resume_position_seconds(airplay_video);
+-        float start_pos = get_start_position_seconds(airplay_video);
+-	//printf("========= %f ============call on_video_play===== %f ==========\n", start_pos, resume_pos);
+-        raop->callbacks.on_video_play(raop->callbacks.cls,
+-                                      get_playback_location(airplay_video),
+-                                      resume_pos > start_pos ? resume_pos : start_pos);
+-        return;
+-    }
+-    
+-    /* initialize a new playlist (airplay_video structure) */
+-    /* first delete any short stored playlists (probably advertisements */
+-    int count = 0;
+-    for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
+-        if (raop->airplay_video[i]) {
+-            float duration = get_duration(raop->airplay_video[i]); 
+-            if (duration < (float) MIN_STORED_AIRPLAY_VIDEO_DURATION_SECONDS ) { //likely to be an advertisement
+-                logger_log(raop->logger, LOGGER_INFO,
+-                          "deleting playlist playback_uuid %s duration (seconds) %f",
+-                           get_playback_uuid(raop->airplay_video[i]), duration);
+-                raop_destroy_airplay_video(raop, i);
+-            } else {
+-                count++;
+-            }
+-        }
+-    }
+-
+-    assert (count < MAX_AIRPLAY_VIDEO);
+-    assert(id == -1);
+-    /* initialize new airplay_video structure to hold playlist */
+-    for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
+-        if (raop->airplay_video[i]) {
+-            continue;
+-        }
+-        id = i;
+-        break;
+-    }
+-    assert(id >= 0);
+-
+-    raop->current_video = id;
+-    raop->airplay_video[id] = airplay_video_init(raop, raop->port, raop->lang);
+-    airplay_video = hls_get_current_video(raop);
+-    assert(airplay_video);
+-    set_apple_session_id(airplay_video, apple_session_id, strlen(apple_session_id));
+-    set_playback_uuid(airplay_video, playback_uuid, strlen(playback_uuid));
+-    free(playback_uuid);
+-    playback_uuid = NULL;
+-    count++;
+-
+-    /* ensure that space will always be available for adding future playlists */
+-
+-    if (count == MAX_AIRPLAY_VIDEO) {
+-        int next = (id + 1) % (int) MAX_AIRPLAY_VIDEO;
+-        logger_log(raop->logger, LOGGER_INFO,
+-                   "deleting playlist playback_uuid %s duration (seconds) %f",
+-                   get_playback_uuid(raop->airplay_video[next]),
+-                   get_duration(raop->airplay_video[next]));
+-        airplay_video_destroy(raop->airplay_video[next]);
+-        raop->airplay_video[next] = NULL;
+-    }
+-#if 0    
+-    for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
+-        printf("new: airplay_video[%d] %p %s %f\n", i, raop->airplay_video[i],
+-	       get_playback_uuid(raop->airplay_video[i]),
+-	       get_duration(raop->airplay_video[i]));
+-    }
+-#endif
+-
+-    set_start_position_seconds(airplay_video, (float) start_position_seconds);
+-
+-    /* we only support HLS if the playback location is terminated by "/master.m3u8" */
+-    const char *uri_suffix = strstr(playback_location, "/master.m3u8");
+-    if (uri_suffix) {
+-        size_t len = strlen(get_uri_local_prefix(airplay_video)) + strlen(uri_suffix);
+-        char *location = (char *) calloc(len + 1, sizeof(char));
+-        if (!location) {
+-            printf("Memory allocation failed (location)\n");
+-            exit(1);
+-        }
+-        strcat(location, get_uri_local_prefix(airplay_video));
+-        strcat(location, uri_suffix);
+-        set_playback_location(airplay_video, location, strlen(location));
+-        free(location);
+-        char *uri_prefix = (char *) calloc(strlen(playback_location) + 1, sizeof(char));
+-        if (!playback_location) {
+-            printf("Memeory allocation failed (playback_location)\n");
+-            exit(1);
+-        }
+-        strcat(uri_prefix, playback_location);
+-        char *end = strstr(uri_prefix, "/master.m3u8");
+-        *end = '\0';						  
+-        set_uri_prefix(airplay_video, uri_prefix, strlen(uri_prefix));
+-        free (uri_prefix);
+-        set_next_media_uri_id(airplay_video, 0);
+-        fcup_request((void *) conn, playback_location, apple_session_id, get_next_FCUP_RequestID(airplay_video));
+-    } else if (!strncmp(playback_location, "http://", strlen("http://")) ||
+-               !strncmp(playback_location, "https://", strlen("https://"))) {
+-        set_playback_location(airplay_video, playback_location, strlen(playback_location));
+-        raop->callbacks.on_video_play(raop->callbacks.cls,
+-                                      get_playback_location(airplay_video),
+-                                      start_position_seconds);
+-        raop->callbacks.on_video_wait_ready(raop->callbacks.cls);
+-    } else {
+-        logger_log(raop->logger, LOGGER_ERR, "Content-Location has unsupported form:\n%s\n", playback_location);
+-        goto play_error;
+-    }
+-
+-    raop->video_play_conn = (void *) conn;
+-
+-    free(playback_location);
+-
++    start_playback(raop, conn, response, apple_session_id,
++                   playback_location, playback_uuid, start_position_seconds);
+     if (req_root_node) {
+         plist_free(req_root_node);
+     }
+@@ -995,9 +1057,6 @@
+     if (req_root_node) {
+         plist_free(req_root_node);
+     }
+-    if (id >= 0 && raop->airplay_video[id] && !get_playback_location(raop->airplay_video[id])) {
+-        raop_destroy_airplay_video(raop, id);
+-    }
+     logger_log(raop->logger, LOGGER_ERR, "Could not find valid Plist Data for POST/play request, Unhandled");
+     http_response_init(response, "HTTP/1.1", 400, "Bad Request");
+ }
